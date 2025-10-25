@@ -27,9 +27,9 @@ static struct bt_conn *connection;
 static uint8_t latest_num_steps_reported;
 static uint8_t latest_local_steps[STEP_DATA_BUF_LEN];
 
-static const char sample_str[] = "CS Test Sample";
+static const char sample_str[] = "CLEME";
 static const struct bt_data ad[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, "CS Test Sample", sizeof(sample_str) - 1),
+	BT_DATA(BT_DATA_NAME_COMPLETE, "CLEME", sizeof(sample_str) - 1),
 };
 
 static void subevent_result_cb(struct bt_conn_le_cs_subevent_result *result)

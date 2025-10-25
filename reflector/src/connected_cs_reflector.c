@@ -2,6 +2,10 @@
  * Copyright (c) 2024 Nordic Semiconductor ASA
  *
  * SPDX-License-Identifier: Apache-2.0
+ * 
+ * Modified version of connected_cs_reflector.c
+ * Press Button 0 → start advertising (accept connections)
+ * LED 0 → ON while connected
  */
 
 #include <math.h>
@@ -10,11 +14,28 @@
 #include <zephyr/bluetooth/cs.h>
 #include <zephyr/bluetooth/att.h>
 #include <zephyr/bluetooth/gatt.h>
+#include <zephyr/drivers/gpio.h>
 #include "common.h"
 
 #define CS_CONFIG_ID     0
 #define NUM_MODE_0_STEPS 1
 
+/* --- GPIO setup --- */
+#define LED0_PORT  DT_NODELABEL(gpio2)
+#define LED0_PIN   9
+
+#define BUTTON0_PORT DT_NODELABEL(gpio1)
+#define BUTTON0_PIN  13
+
+#define LED3_PORT   DT_NODELABEL(gpio1)
+#define LED3_PIN    14
+
+static const struct device *led0_dev, *btn0_dev, *led3_dev;
+static struct gpio_callback btn_cb_data;
+
+static volatile bool start_advertising = false;
+
+/* --- Bluetooth stuff --- */
 static K_SEM_DEFINE(sem_remote_capabilities_obtained, 0, 1);
 static K_SEM_DEFINE(sem_config_created, 0, 1);
 static K_SEM_DEFINE(sem_cs_security_enabled, 0, 1);
@@ -27,11 +48,12 @@ static uint16_t step_data_attr_handle;
 static struct bt_conn *connection;
 static uint8_t latest_local_steps[STEP_DATA_BUF_LEN];
 
-static const char sample_str[] = "CS Sample";
+static const char sample_str[] = "CLEME";
 static const struct bt_data ad[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, "CS Sample", sizeof(sample_str) - 1),
+	BT_DATA(BT_DATA_NAME_COMPLETE, "CLEME", sizeof(sample_str) - 1),
 };
 
+/* --- Callbacks for CS and BLE --- */
 static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subevent_result *result)
 {
 	if (result->step_data_buf) {
@@ -71,6 +93,9 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
 
 	connection = bt_conn_ref(conn);
 
+/* Turn LED on to indicate active connection */
+	gpio_pin_set(led0_dev, LED0_PIN, 1);
+
 	static struct bt_gatt_exchange_params mtu_exchange_params = {.func = mtu_exchange_cb};
 
 	err = bt_gatt_exchange_mtu(connection, &mtu_exchange_params);
@@ -87,8 +112,14 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 
 	bt_conn_unref(conn);
 	connection = NULL;
+
+	/* Turn LED off when disconnected */
+	gpio_pin_set(led0_dev, LED0_PIN, 0); 
+
+	gpio_pin_set(led3_dev, LED3_PIN, 0);
 }
 
+/* --- boh --- */
 static void remote_capabilities_cb(struct bt_conn *conn,
 				   uint8_t status,
 				   struct bt_conn_le_cs_capabilities *params)
@@ -140,6 +171,7 @@ static void procedure_enable_cb(struct bt_conn *conn,
 	}
 }
 
+/* --- GATT discovery and write --- */
 static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			     struct bt_gatt_discover_params *params)
 {
@@ -189,14 +221,44 @@ BT_CONN_CB_DEFINE(conn_cb) = {
 	.le_cs_subevent_data_available = subevent_result_cb,
 };
 
+/* --- Button callback: starts advertising --- */
+static void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	printk("Button pressed → starting advertising\n");
+	start_advertising = true;
+}
+
+/* --- GPIO init --- */
+static void gpio_init(void)
+{
+	led0_dev = DEVICE_DT_GET(LED0_PORT);
+	btn0_dev = DEVICE_DT_GET(BUTTON0_PORT);
+	led3_dev = DEVICE_DT_GET(LED3_PORT);
+
+	if (!device_is_ready(led0_dev) || !device_is_ready(btn0_dev) || !device_is_ready(led3_dev)) {
+    printk("Error: GPIO device(s) not ready\n");
+    return;
+	}
+
+	gpio_pin_configure(led0_dev, LED0_PIN, GPIO_OUTPUT_INACTIVE);
+	gpio_pin_configure(btn0_dev, BUTTON0_PIN, GPIO_INPUT | GPIO_PULL_UP);
+	gpio_pin_configure(led3_dev, LED3_PIN, GPIO_OUTPUT_INACTIVE);
+
+	gpio_pin_interrupt_configure(btn0_dev, BUTTON0_PIN, GPIO_INT_EDGE_TO_ACTIVE);
+	gpio_init_callback(&btn_cb_data, button_pressed, BIT(BUTTON0_PIN));
+	gpio_add_callback(btn0_dev, &btn_cb_data);
+}
+
 int main(void)
 {
 	int err;
 	struct bt_gatt_discover_params discover_params;
 	struct bt_gatt_write_params write_params;
 
-	printk("Starting Channel Sounding Demo\n");
-
+	printk("Starting button-controlled BLE demo\n");
+	
+	gpio_init();
+	
 	/* Initialize the Bluetooth Subsystem */
 	err = bt_enable(NULL);
 	if (err) {
@@ -204,66 +266,89 @@ int main(void)
 		return 0;
 	}
 
-	err = bt_le_adv_start(BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, BT_GAP_ADV_FAST_INT_MIN_1,
-					      BT_GAP_ADV_FAST_INT_MAX_1, NULL),
-			      ad, ARRAY_SIZE(ad), NULL, 0);
-	if (err) {
-		printk("Advertising failed to start (err %d)\n", err);
-		return 0;
-	}
-
-	k_sem_take(&sem_connected, K_FOREVER);
-
-	const struct bt_le_cs_set_default_settings_param default_settings = {
-		.enable_initiator_role = false,
-		.enable_reflector_role = true,
-		.cs_sync_antenna_selection = BT_LE_CS_ANTENNA_SELECTION_OPT_REPETITIVE,
-		.max_tx_power = BT_HCI_OP_LE_CS_MAX_MAX_TX_POWER,
-	};
-
-	err = bt_le_cs_set_default_settings(connection, &default_settings);
-	if (err) {
-		printk("Failed to configure default CS settings (err %d)\n", err);
-	}
-
-	discover_params.uuid = &step_data_char_uuid.uuid;
-	discover_params.func = discover_func;
-	discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
-	discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
-	discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-
-	err = bt_gatt_discover(connection, &discover_params);
-	if (err) {
-		printk("Discovery failed (err %d)\n", err);
-		return 0;
-	}
-
-	err = k_sem_take(&sem_discovered, K_SECONDS(10));
-	if (err) {
-		printk("Timed out during GATT discovery\n");
-		return 0;
-	}
-
 	while (true) {
-		k_sem_take(&sem_procedure_done, K_FOREVER);
+    /* 1) Aspetta che l’utente prema il bottone */
+    while (!start_advertising) {
+        k_msleep(50);
+    }
+    start_advertising = false;
 
-		write_params.func = write_func;
-		write_params.handle = step_data_attr_handle;
-		write_params.length = STEP_DATA_BUF_LEN;
-		write_params.data = &latest_local_steps[0];
-		write_params.offset = 0;
+    printk("Advertising enabled, waiting for connection...\n");
+    err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), NULL, 0);
+    if (err) {
+        printk("Advertising failed (err %d)\n", err);
+		gpio_pin_set(led3_dev, LED3_PIN, 0);
+        continue; /* riprova alla prossima pressione */
+    }
 
-		err = bt_gatt_write(connection, &write_params);
-		if (err) {
-			printk("Write failed (err %d)\n", err);
-			return 0;
-		}
+	gpio_pin_set(led3_dev, LED3_PIN, 1); /* LED3 ON: advertising attivo */
 
-		err = k_sem_take(&sem_written, K_SECONDS(10));
-		if (err) {
-			printk("Timed out during GATT write\n");
-			return 0;
-		}
+    /* 2) Attendi connessione (LED si accenderà in connected_cb) */
+    k_sem_take(&sem_connected, K_FOREVER);
+
+    /* Una volta connessi, ferma l’advertising */
+    bt_le_adv_stop();
+
+	gpio_pin_set(led3_dev, LED3_PIN, 0); /* LED3 OFF: advertising fermato */
+
+    /* 3) (Come prima) Discovery + loop di write */
+    const struct bt_le_cs_set_default_settings_param default_settings = {
+        .enable_initiator_role = false,
+        .enable_reflector_role = true,
+        .cs_sync_antenna_selection = BT_LE_CS_ANTENNA_SELECTION_OPT_REPETITIVE,
+        .max_tx_power = BT_HCI_OP_LE_CS_MAX_MAX_TX_POWER,
+    };
+
+    err = bt_le_cs_set_default_settings(connection, &default_settings);
+    if (err) {
+        printk("Failed to configure default CS settings (err %d)\n", err);
+    }
+
+    struct bt_gatt_discover_params discover_params;
+    discover_params.uuid = &step_data_char_uuid.uuid;
+    discover_params.func = discover_func;
+    discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+    discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+    discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+    err = bt_gatt_discover(connection, &discover_params);
+    if (err) {
+        printk("Discovery failed (err %d)\n", err);
+        continue;
+    }
+    err = k_sem_take(&sem_discovered, K_SECONDS(10));
+    if (err) {
+        printk("Timed out during GATT discovery\n");
+        continue;
+    }
+
+    /* 4) Loop di write (uguale al tuo) */
+    while (connection) {
+        k_sem_take(&sem_procedure_done, K_FOREVER);
+
+        struct bt_gatt_write_params write_params = {
+            .func = write_func,
+            .handle = step_data_attr_handle,
+            .length = STEP_DATA_BUF_LEN,
+            .data = &latest_local_steps[0],
+            .offset = 0,
+        };
+
+        err = bt_gatt_write(connection, &write_params);
+        if (err) {
+            printk("Write failed (err %d)\n", err);
+            break;
+        }
+
+        err = k_sem_take(&sem_written, K_SECONDS(10));
+        if (err) {
+            printk("Timed out during GATT write\n");
+            break;
+        }
+    }
+
+    /* Quando si disconnette, il LED si spegne in disconnected_cb.
+       Il while(true) esterno ti riporta ad attendere una nuova pressione del bottone. */
 	}
 
 	return 0;
