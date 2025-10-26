@@ -17,12 +17,12 @@ static struct bt_le_cs_test_param test_params_get(enum bt_conn_le_cs_role role)
 	params.role = role;
 	params.main_mode = BT_CONN_LE_CS_MAIN_MODE_2;
 	params.sub_mode = BT_CONN_LE_CS_SUB_MODE_1;
-	params.main_mode_repetition = 1;
+	params.main_mode_repetition = 0;
 	params.mode_0_steps = NUM_MODE_0_STEPS;
 	params.rtt_type = BT_CONN_LE_CS_RTT_TYPE_AA_ONLY;
 	params.cs_sync_phy = BT_CONN_LE_CS_SYNC_1M_PHY;
 	params.cs_sync_antenna_selection = BT_LE_CS_TEST_CS_SYNC_ANTENNA_SELECTION_ONE;
-	params.subevent_len = 5000;
+	params.subevent_len = 2000;
 	params.subevent_interval = 0;
 	params.max_num_subevents = 1;
 	params.transmit_power_level = BT_HCI_OP_LE_CS_TEST_MAXIMIZE_TX_POWER;
