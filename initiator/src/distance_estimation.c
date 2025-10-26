@@ -253,9 +253,6 @@ static bool process_step_data(struct bt_le_cs_subevent_step *step, void *user_da
 	return true;
 }
 
-// OLD:
-// void estimate_distance(uint8_t *local_steps, ... , enum bt_conn_le_cs_role role);
-
 void estimate_distance(uint8_t *local_steps, uint16_t local_steps_len, uint8_t *peer_steps,
                uint16_t peer_steps_len, uint8_t n_ap, 
                enum bt_conn_le_cs_role role, const char *name)
@@ -309,7 +306,6 @@ void estimate_distance(uint8_t *local_steps, uint16_t local_steps_len, uint8_t *
 	if (rtt_based_distance == 0.0f && phase_slope_based_distance == 0.0f) {
         printk("A reliable distance estimate could not be computed.\n");
     } else {
-    // --- CHANGE THIS LINE ---
     printk("Estimated distance to %s:\n", name);
 	}
 
@@ -321,5 +317,24 @@ void estimate_distance(uint8_t *local_steps, uint16_t local_steps_len, uint8_t *
         printk("- Phase-Based Ranging method: %f meters (derived from %d samples)\n",
                (double)phase_slope_based_distance, context.mode_2_data_index);
     }
+
+	/* Print ONCE achievement unlocked (for example) when the estimated distance */
+	static bool achievement_unlocked = false;
+
+	float final_distance = 0.0f;
+
+	/* Prefer RTT distance if available, otherwise phase-based */
+	if (rtt_based_distance > 0.0f) {
+		final_distance = rtt_based_distance;
+	} else if (phase_slope_based_distance > 0.0f) {
+		final_distance = phase_slope_based_distance;
+	}
+
+	/* Example: unlock when distance < 1 meter */
+	if (!achievement_unlocked && final_distance > 0.0f && final_distance < 1.0f) {
+		achievement_unlocked = true;
+		printk("🏆 Achievement unlocked: Close proximity achieved (%.2f m)!\n", (double)final_distance);
+	}
+
 
 }

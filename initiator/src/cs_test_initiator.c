@@ -37,7 +37,7 @@ static struct bt_gatt_attr gatt_attributes[] = {
 			       NULL),
 };
 static struct bt_gatt_service step_data_gatt_service = BT_GATT_SERVICE(gatt_attributes);
-static const char sample_str[] = "PIPPO";
+static const char sample_str[] = "Beacon";
 
 static ssize_t on_attr_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
