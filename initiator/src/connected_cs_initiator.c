@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Initiator (Rune) - Modified
- * 1. Scans for Reflector ("CLEME").
- * 2. On Find: Turn ON LED0, wait for button press.
+ * 1. Scans for Reflector ("Beacon").
+ * 2. On Find: Start BLINKING LED0, wait for button press (with timeout).
  * 3. On Button Press: Turn OFF LED0, connect and start CS.
+ * 4. On Timeout: Turn OFF LED0, restart scan.
  */
 
 #include <math.h>
@@ -16,19 +17,22 @@
 #include <zephyr/bluetooth/att.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/kernel.h> /* --- MODIFIED: Added for k_msleep --- */
+#include <zephyr/kernel.h>
+#include <zephyr/sys/util.h> 
+#include <zephyr/toolchain.h> 
 #include "distance_estimation.h"
 #include "common.h"
 
 #define CS_CONFIG_ID     0
 #define NUM_MODE_0_STEPS 1
 
-/* --- NEW: GPIO setup --- */
+/* --- GPIO setup --- */
 #define LED0_PORT DT_NODELABEL(gpio2)
 #define LED0_PIN 9
 
 #define BUTTON0_PORT DT_NODELABEL(gpio1)
 #define BUTTON0_PIN 13
+#define BUTTON_PRESS_TIMEOUT_S 10
 
 static const struct device *led0_dev, *btn0_dev;
 static struct gpio_callback btn_cb_data;
@@ -42,9 +46,10 @@ static K_SEM_DEFINE(sem_cs_security_enabled, 0, 1);
 static K_SEM_DEFINE(sem_procedure_done, 0, 1);
 static K_SEM_DEFINE(sem_connected, 0, 1);
 static K_SEM_DEFINE(sem_data_received, 0, 1);
-
-/* --- MODIFIED: Added semaphore for button press --- */
 static K_SEM_DEFINE(sem_button_pressed, 0, 1);
+
+static struct k_timer led_blink_timer;
+static volatile bool led_is_on = false;
 
 static struct bt_conn *connection;
 static uint8_t n_ap;
@@ -53,13 +58,28 @@ static uint16_t latest_step_data_len;
 static uint8_t latest_local_steps[STEP_DATA_BUF_LEN];
 static uint8_t latest_peer_steps[STEP_DATA_BUF_LEN];
 
-/* --- NEW: State for deferred connection --- */
 static bt_addr_le_t found_addr;
 static volatile bool awaiting_connect_confirmation = false;
 
+/* Scan interval: 0x0020 = 32 * 0.625ms = 20ms */
+/* Scan window:   0x0020 = 32 * 0.625ms = 20ms */
+static struct bt_le_scan_param fast_scan_params = {
+    .type = BT_LE_SCAN_TYPE_ACTIVE,
+    .options = BT_LE_SCAN_OPT_NONE,
+    .interval = 0x0020,
+    .window = 0x0020,
+};
+
+/* Time handler for blinking LED */
+static void blink_timer_handler(struct k_timer *timer_id)
+{
+    ARG_UNUSED(timer_id);
+    led_is_on = !led_is_on;
+    gpio_pin_set(led0_dev, LED0_PIN, (int)led_is_on);
+}
 
 static ssize_t on_attr_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                              const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
+                                const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
     if (flags & BT_GATT_WRITE_FLAG_PREPARE) {
         return 0;
@@ -86,12 +106,11 @@ static ssize_t on_attr_write_cb(struct bt_conn *conn, const struct bt_gatt_attr 
 static struct bt_gatt_attr gatt_attributes[] = {
     BT_GATT_PRIMARY_SERVICE(&step_data_svc_uuid),
     BT_GATT_CHARACTERISTIC(&step_data_char_uuid.uuid, BT_GATT_CHRC_WRITE,
-                         BT_GATT_PERM_WRITE | BT_GATT_PERM_PREPARE_WRITE, NULL,
-                         on_attr_write_cb, NULL),
+                           BT_GATT_PERM_WRITE | BT_GATT_PERM_PREPARE_WRITE, NULL,
+                           on_attr_write_cb, NULL),
 };
 static struct bt_gatt_service step_data_gatt_service = BT_GATT_SERVICE(gatt_attributes);
-static const char sample_str[] = "PIPPO";
-
+static const char sample_str[] = "Beacon";
 
 static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subevent_result *result)
 {
@@ -133,7 +152,6 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
         connection = NULL;
     } else {
         printk("Connected to %s (err 0x%02X)\n", addr, err);
-        /* connection is set in main thread, just ref it */
         connection = bt_conn_ref(conn);
 
         static struct bt_gatt_exchange_params mtu_exchange_params = {.func = mtu_exchange_cb};
@@ -144,7 +162,6 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
         }
     }
 
-    /* Signal main thread regardless of success, main will check connection */
     k_sem_give(&sem_connected);
 }
 
@@ -239,8 +256,6 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
                          struct net_buf_simple *ad)
 {
     char name[NAME_LEN] = {};
-
-    /* Don't scan if we're already connecting or connected */
     if (connection || awaiting_connect_confirmation) {
         return;
     }
@@ -251,12 +266,6 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
     bt_data_parse(ad, data_cb, name);
 
-    if (name[0] != '\0') {
-        /* You can uncomment this to see all devices */
-        /* printk("Found device: %s (RSSI: %d)\n", name, rssi); */
-    }
-    
-    /* --- MODIFIED: Use strncasecmp for "Cleme" or "CLEME" --- */
     if (strncasecmp(name, sample_str, sizeof(sample_str) - 1) != 0) {
         return;
     }
@@ -268,26 +277,23 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
     printk("Found Totem %s. Press Button 0 to connect...\n", name);
 
-    /* Save connection info */
     bt_addr_le_copy(&found_addr, addr);
     memcpy(connected_reflector_name, name, NAME_LEN);
     awaiting_connect_confirmation = true;
 
-    /* Turn ON LED0 to signal "found" */
+    led_is_on = true;
     gpio_pin_set(led0_dev, LED0_PIN, 1);
+    /* Blink every 250ms */
+    k_timer_start(&led_blink_timer, K_MSEC(250), K_MSEC(250));
 }
 
-/* --- MODIFIED: Button callback --- */
 static void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-    /* This is an ISR - DO NOT do heavy work here */
     if (awaiting_connect_confirmation) {
-        /* Just signal the main thread */
         k_sem_give(&sem_button_pressed);
     }
 }
 
-/* --- NEW: GPIO init --- */
 static void gpio_init(void)
 {
     led0_dev = DEVICE_DT_GET(LED0_PORT);
@@ -323,9 +329,11 @@ int main(void)
 
     printk("Starting Channel Sounding Demo (Initiator/Rune)\n");
 
-    /* --- NEW --- */
     gpio_init();
-	
+
+    /* Initialize blink timer */
+    k_timer_init(&led_blink_timer, blink_timer_handler, NULL);
+    
     /* Clear all old bonds to prevent security errors */
     bt_unpair(BT_ID_DEFAULT, NULL);
 
@@ -342,56 +350,62 @@ int main(void)
         return 0;
     }
 
-    /* --- MODIFIED: Main loop logic completely changed for button defer --- */
     while (true) {
         printk("Starting scan for Totem...\n");
         awaiting_connect_confirmation = false;
-        gpio_pin_set(led0_dev, LED0_PIN, 0); /* Ensure LED is off */
+        led_is_on = false;
+        gpio_pin_set(led0_dev, LED0_PIN, 0);
         
-        /* Reset semaphores from previous run */
         k_sem_reset(&sem_button_pressed);
         k_sem_reset(&sem_connected);
 
-        err = bt_le_scan_start(BT_LE_SCAN_ACTIVE_CONTINUOUS, device_found);
+        err = bt_le_scan_start(&fast_scan_params, device_found);
         if (err) {
             printk("Scanning failed to start (err %d)\n", err);
             return 0;
         }
 
-        /* 1. Wait until device_found() (ISR) runs and sets the flag */
+        /* Wait until device_found() (ISR) runs and sets the flag */
         while (!awaiting_connect_confirmation) {
             k_msleep(100);
         }
-        /* At this point, scan is stopped, LED0 is ON, and found_addr is valid */
+        /* At this point, scan is stopped, LED0 is BLINKING, and found_addr is valid */
 
-        /* 2. Wait for button_pressed() (ISR) to give the semaphore */
-        k_sem_take(&sem_button_pressed, K_FOREVER);
+        /* Wait for button_pressed() (ISR), with a timeout */
+        int button_press_result = k_sem_take(&sem_button_pressed, K_SECONDS(BUTTON_PRESS_TIMEOUT_S));
+
+        k_timer_stop(&led_blink_timer);
+        led_is_on = false;
+        gpio_pin_set(led0_dev, LED0_PIN, 0);
+
+        if (button_press_result != 0) {
+            printk("Button press timed out (%ds). Restarting scan.\n", BUTTON_PRESS_TIMEOUT_S);
+            awaiting_connect_confirmation = false;
+            continue;
+        }
         
-        /* 3. Button was pressed! Now we (main thread) do the connection work */
+        /* Button was pressed and connects */
         printk("Button pressed, attempting to connect...\n");
         awaiting_connect_confirmation = false;
-        gpio_pin_set(led0_dev, LED0_PIN, 0); /* Turn OFF LED0 */
 
         err = bt_conn_le_create(&found_addr, BT_CONN_LE_CREATE_CONN,
-                              BT_LE_CONN_PARAM_DEFAULT, &connection);
+                                BT_LE_CONN_PARAM_DEFAULT, &connection);
         if (err) {
             printk("Create conn failed (%u). Restarting scan.\n", err);
-            connection = NULL; /* ensure connection is NULL */
-            continue; /* Go to top of while(true) and restart scan */
+            connection = NULL; 
+            continue;
         }
 
-        /* 4. Wait for connected_cb() (ISR) to give sem_connected */
         k_sem_take(&sem_connected, K_FOREVER);
 
         /* Check if connection was successful */
         if (connection == NULL) {
             printk("Connection attempt failed, restarting scan.\n");
-            continue; /* Loop back to restart scanning */
+            continue;
         }
 
         printk("Connection successful. Proceeding with CS setup.\n");
 
-        /* --- ALL CS/GATT LOGIC IS UNCHANGED FROM HERE --- */
         
         const struct bt_le_cs_set_default_settings_param default_settings = {
             .enable_initiator_role = true,
@@ -413,7 +427,7 @@ int main(void)
         }
 
         k_sem_take(&sem_acl_encryption_enabled, K_FOREVER);
-        if (connection == NULL) { continue; } /* Check if disconnected */
+        if (connection == NULL) { continue; }
 
 
         err = bt_le_cs_read_remote_supported_capabilities(connection);
@@ -424,7 +438,7 @@ int main(void)
         }
 
         k_sem_take(&sem_remote_capabilities_obtained, K_FOREVER);
-        if (connection == NULL) { continue; } /* Check if disconnected */
+        if (connection == NULL) { continue; }
 
         struct bt_le_cs_create_config_params config_params = {
             .id = CS_CONFIG_ID,
@@ -454,7 +468,7 @@ int main(void)
         }
 
         k_sem_take(&sem_config_created, K_FOREVER);
-        if (connection == NULL) { continue; } /* Check if disconnected */
+        if (connection == NULL) { continue; }
 
         err = bt_le_cs_security_enable(connection);
         if (err) {
@@ -464,7 +478,7 @@ int main(void)
         }
 
         k_sem_take(&sem_cs_security_enabled, K_FOREVER);
-        if (connection == NULL) { continue; } /* Check if disconnected */
+        if (connection == NULL) { continue; }
 
         const struct bt_le_cs_set_procedure_parameters_param procedure_params = {
             .config_id = CS_CONFIG_ID,
@@ -516,7 +530,7 @@ int main(void)
                 latest_step_data_len -
                 NUM_MODE_0_STEPS *
                     (sizeof(struct bt_hci_le_cs_step_data_mode_0_initiator) -
-                    sizeof(struct bt_hci_le_cs_step_data_mode_0_reflector)),
+                     sizeof(struct bt_hci_le_cs_step_data_mode_0_reflector)),
                 n_ap, BT_CONN_LE_CS_ROLE_INITIATOR,
                 connected_reflector_name);
         }

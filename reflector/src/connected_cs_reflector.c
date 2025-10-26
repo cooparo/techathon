@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * Reflector (Beacon/Totem) - Modified
+ * Reflector (Beacon) - Modified
  * 1. Advertises immediately on boot.
  * 2. Accepts any connection.
  * 3. LED0 ON when connected, OFF when disconnected/advertising.
@@ -17,7 +17,7 @@
 #include <zephyr/bluetooth/att.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/kernel.h> /* --- FIX: Added for k_sleep/k_sem_take --- */
+#include <zephyr/kernel.h> 
 #include "common.h"
 
 #define CS_CONFIG_ID 0
@@ -44,12 +44,11 @@ static uint16_t step_data_attr_handle;
 static struct bt_conn *connection;
 static uint8_t latest_local_steps[STEP_DATA_BUF_LEN];
 
-static const char sample_str[] = "PIPPO";
+static const char sample_str[] = "Beacon";
 static const struct bt_data ad[] = {
-    BT_DATA(BT_DATA_NAME_COMPLETE, "PIPPO", sizeof(sample_str) - 1),
+    BT_DATA(BT_DATA_NAME_COMPLETE, "beacon", sizeof(sample_str) - 1),
 };
 
-/* --- Callbacks for CS and BLE --- */
 static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subevent_result *result)
 {
     if (result->step_data_buf) {
@@ -89,7 +88,6 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
     if (err) {
         bt_conn_unref(conn);
         connection = NULL;
-        /* --- MODIFIED --- */
         /* Ensure LED is off if connection fails */
         gpio_pin_set(led0_dev, LED0_PIN, 0);
         return;
@@ -97,8 +95,7 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
 
     connection = bt_conn_ref(conn);
 
-    /* --- MODIFIED --- */
-    /* Turn LED0 ON (solid) to indicate connection */
+    /* Turn LED0 ON (solid) if connected */
     gpio_pin_set(led0_dev, LED0_PIN, 1);
 
     static struct bt_gatt_exchange_params mtu_exchange_params = {.func = mtu_exchange_cb};
@@ -117,13 +114,10 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 
     bt_conn_unref(conn);
     connection = NULL;
-
-    /* --- MODIFIED --- */
     /* Turn LED0 OFF */
     gpio_pin_set(led0_dev, LED0_PIN, 0);
 }
 
-/* --- boh --- */
 static void remote_capabilities_cb(struct bt_conn *conn,
                                      uint8_t status,
                                      struct bt_conn_le_cs_capabilities *params)
@@ -225,9 +219,7 @@ BT_CONN_CB_DEFINE(conn_cb) = {
     .le_cs_subevent_data_available = subevent_result_cb,
 };
 
-/* --- Button callback: REMOVED --- */
-
-/* --- MODIFIED: GPIO init --- */
+/* GPIO init */
 static void gpio_init(void)
 {
     led0_dev = DEVICE_DT_GET(LED0_PORT);
@@ -239,7 +231,6 @@ static void gpio_init(void)
 
     gpio_pin_configure(led0_dev, LED0_PIN, GPIO_OUTPUT_INACTIVE);
 
-    /* Button init and callback setup removed */
 }
 
 int main(void)
@@ -252,10 +243,8 @@ int main(void)
 
     gpio_init();
 
-	/* Clear all old bonds to prevent security errors */
     bt_unpair(BT_ID_DEFAULT, NULL);
 
-    /* Initialize the Bluetooth Subsystem */
     err = bt_enable(NULL);
     if (err) {
         printk("Bluetooth init failed (err %d)\n", err);
@@ -263,8 +252,7 @@ int main(void)
     }
 
     while (true) {
-        /* --- MODIFIED --- */
-        /* 1) Start advertising immediately */
+        /* Start advertising immediately */
         printk("Advertising enabled, waiting for connection...\n");
 
         /* Ensure LED0 is OFF while advertising */
@@ -275,17 +263,17 @@ int main(void)
             printk("Advertising failed (err %d)\n", err);
             gpio_pin_set(led0_dev, LED0_PIN, 0);
             k_sleep(K_SECONDS(1));
-            continue; /* Try again */
+            continue;
         }
 
-        /* 2) Wait for connection */
+        /* Wait for connection */
         /* connected_cb will set LED0 ON */
         k_sem_take(&sem_connected, K_FOREVER);
 
         /* Stop advertising once connected */
         bt_le_adv_stop();
 
-        /* 3) Proceed with CS and GATT logic as before */
+        /* Proceed with CS and GATT logic */
         const struct bt_le_cs_set_default_settings_param default_settings = {
             .enable_initiator_role = false,
             .enable_reflector_role = true,
@@ -317,14 +305,14 @@ int main(void)
             continue;
         }
 
-        /* 4) Loop while connected */
+        /* Loop while connected */
         while (connection) {
             if (k_sem_take(&sem_procedure_done, K_MSEC(1000)) != 0) {
-                /* Timeout, check if still connected */
+                /* Check if still connected */
                 if (connection == NULL) {
-                    break; /* Exit inner loop if disconnected */
+                    break;
                 }
-                continue; /* Still connected, just missed a procedure */
+                continue;
             }
 
             write_params.func = write_func;
@@ -347,7 +335,6 @@ int main(void)
         }
 
         /* disconnected_cb will have set LED0 OFF */
-        /* The outer while(true) loop will restart advertising */
         printk("Disconnected. Restarting advertising...\n");
     }
 
